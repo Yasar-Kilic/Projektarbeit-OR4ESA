@@ -1,1 +1,235 @@
+import pandas as pd
+import xarray as xr
+import linopy
 
+prices_raw =pd.read_csv(r"C:\Users\don donson\Documents\Uni\OR\Day-ahead_prices_202001010000_202101010000_Hour.csv", encoding="latin1")
+pv_raw =pd.read_csv(r"C:\Users\don donson\Documents\Uni\OR\Capacity werte.csv",encoding="latin1", sep=",")
+
+YEARS = [2020, 2024]
+LOCATIONS = ["Stuttgart", "Düsseldorf", "Schleswig-Holstein"]
+
+pv_raw["time"] = pd.to_datetime(pv_raw["time"], utc=True)
+pv_raw["year"] = pv_raw["time"].dt.year
+
+print("Price data:")
+print(prices_raw.head())
+print(prices_raw.shape)
+
+print("PV data:")
+print(pv_raw.head())
+print(pv_raw.shape)
+
+def prepare_data(year, location):
+    pv_scenario = pv_raw[pv_raw["year"] == year].copy()
+
+    price_scenario = prices_raw[str(year)].copy()
+
+    data = pd.DataFrame({
+        "time": pv_scenario["time"].values,
+        "price": price_scenario.values,
+        "pv_cf": pv_scenario[location].values
+    })
+
+    data = data.set_index("time")
+    data.index.name = "time"
+
+    return data
+
+def run_model(year, location):
+    data = prepare_data(year, location)
+
+    time = data.index
+    time.name = "time"
+
+    price = xr.DataArray(
+        data["price"].values/1000.0,  # Convert from €/MWh to €/kWh
+        coords={"time": time},
+        dims=["time"]
+    )
+
+    pv_cf = xr.DataArray(
+        data["pv_cf"].values,
+        coords={"time": time},
+        dims=["time"]
+)
+
+    #Parameter die echten daten brauchen wir noch 
+    E_unit = 1000.0   # kWh pro Einheit (1 MWh, a 1/10 average for LSS)
+    P_unit = 900.0    # kW pro Batterie-Einheit (0,9 MW, a 1/10 average for LSS)
+    bat_inv_cost_per_kWh = 390.0  # €/kWh (LSS average price)
+    bat_inv_cost_per_unit = bat_inv_cost_per_kWh * E_unit  # € pro Einheit
+    budget = 1000000000.0  # Budget in €
+    pv_inv_cost = 800.0  # €/kW (utility-scale PV)
+    eta_charge = 0.95
+    eta_discharge = 0.95
+    # Lifetimes
+    lifetime_pv = 25      # years for PV
+    lifetime_bat = 12     # years for battery
+    # Annualized costs (simple division by lifetime)
+    pv_inv_cost_annual = pv_inv_cost / lifetime_pv
+    bat_inv_cost_per_unit_annual = bat_inv_cost_per_unit / lifetime_bat
+    #annuitätenfaktoren für die Diskontierung der Investitionskosten
+    r = 0.05            # 5% Diskontsatz
+    T_pv = 25           # Jahre für PV
+    T_bat = 12          # Jahre für Batterie
+
+    # Annuitätenfaktoren
+    annuity_factor_pv = (r * (1 + r)**T_pv) / ((1 + r)**T_pv - 1)
+    annuity_factor_bat = (r * (1 + r)**T_bat) / ((1 + r)**T_bat - 1)
+
+    # Annualisierte Kosten mit Diskontierung
+    pv_inv_cost_annual = pv_inv_cost * annuity_factor_pv
+    bat_inv_cost_per_unit_annual = bat_inv_cost_per_unit * annuity_factor_bat
+
+    dt = 1.0  # 1 Stunde pro Zeitschritt
+
+    # Create the optimization model
+    m = linopy.Model()
+
+    #Capacityvariables
+    C_pv = m.add_variables(lower=0, name="C_pv")
+    N_bat = m.add_variables(lower=0, name="N_bat")
+
+    #Time-dependent variables
+    g_pv = m.add_variables(
+                lower=0,
+                dims=["time"],
+                coords={"time": time},
+                name="g_pv"
+        ) # PV generation at each time step [kWh/h]
+    charge = m.add_variables(
+                lower=0,
+                dims=["time"],
+                coords={"time": time},
+                name="charge"
+        ) # Battery charging power at each time step [kW]
+
+    discharge = m.add_variables(
+                lower=0,
+                dims=["time"],
+                coords={"time": time},
+                name="discharge"
+        ) # Battery discharging power at each time step [kW]
+
+    soc = m.add_variables(
+                lower=0,
+                dims=["time"],
+                coords={"time": time},
+                name="soc"
+        ) # State of charge of the battery at each time step [kWh]
+
+    q_sell = m.add_variables(
+                lower=0,
+                dims=["time"],
+                coords={"time": time},
+                name="q_sell"
+        ) # Electricity sold to the grid at each time step [kWh]
+
+#constraints
+    m.add_constraints(
+    g_pv <= C_pv * pv_cf,
+    name="pv_capacity_limit"
+)
+    m.add_constraints(
+    charge <= N_bat * P_unit,
+    name="charge_power_limit"
+)
+    m.add_constraints(
+    discharge <= N_bat * P_unit,
+    name="discharge_power_limit"
+)
+    m.add_constraints(
+    soc <= N_bat * E_unit,
+    name="soc_energy_limit"
+)
+    # Budget constraint
+    m.add_constraints(
+        pv_inv_cost * C_pv + bat_inv_cost_per_unit * N_bat <= budget,
+        name="budget_limit"
+    )
+# Battery state of charge dynamics with shift
+    m.add_constraints(
+    soc == soc.shift(time=1)
+            + eta_charge * charge * dt
+            - discharge * dt / eta_discharge,
+    name="soc_dynamics"
+)
+    beginning = time[0]
+    m.add_constraints(
+    soc.sel(time=beginning) == 0,
+    name="soc_initial"
+) 
+    # Energy balance: PV + discharge = sold + charge
+    m.add_constraints(
+    g_pv + discharge == q_sell + charge,
+    name="energy_balance"
+)
+# Objective: maximize NPV
+    # Annual revenue (assumed same for all years)
+    #annual_revenue = (price * q_sell * dt).sum()
+
+    # CAPEX (full investment cost)
+    #capex = (
+        #pv_inv_cost * C_pv
+        #+ bat_inv_cost_per_unit * N_bat
+    #)
+
+    # NPV calculation
+    # Use battery lifetime (12 years) as conservative estimate
+    #T = 12  # years
+    #r = 0.05  # discount rate
+    
+    # Annuity factor: present value of 1€/year for T years
+    #annuity_factor = ((1 + r)**T - 1) / (r * (1 + r)**T)
+    
+    # NPV = PV of revenue - CAPEX
+    #npv = annual_revenue * annuity_factor - capex
+
+    #m.add_objective(
+        #npv,
+        #sense="max"
+    #)
+     # Objective: maximum profit (annual revenue - annualized costs)
+    revenue = (price * q_sell * dt).sum()
+
+    inv_costs_annual = (
+        pv_inv_cost_annual * C_pv
+        + bat_inv_cost_per_unit_annual * N_bat
+    )
+
+    m.add_objective(
+        revenue - inv_costs_annual,
+        sense="max"
+    )
+
+# Solve
+    result = m.solve()    
+    return {
+        "model": m,
+        "result": result,
+        "C_pv": C_pv,
+        "N_bat": N_bat,
+        "g_pv": g_pv,
+        "charge": charge,
+        "discharge": discharge,
+        "soc": soc,
+        "q_sell": q_sell,
+        "price": price,
+        "pv_cf": pv_cf,
+        "budget": budget,
+    }
+run_model(2020, "Stuttgart")
+if __name__ == "__main__":
+    res = run_model(2020, "Stuttgart")
+    
+    print("Solver status:", res["result"])
+    print("Optimal PV capacity [kW]:", res["C_pv"].solution.values)
+    print("Optimal battery units [-]:", res["N_bat"].solution.values)
+    print("Optimal profit [€]:", res["model"].objective.value)
+    
+    # Calculate used budget
+    used_budget = (
+        (800.0 / 25) * res["C_pv"].solution.values
+        + (390.0 * 1000.0 / 12) * res["N_bat"].solution.values
+    )
+    print("Used annualized budget [€]:", used_budget)
