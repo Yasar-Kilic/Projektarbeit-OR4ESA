@@ -1,235 +1,645 @@
+"""
+OR4ESA Group Work – PV-battery investment model
+Topic 3.1: optimal design and operation of a PV-battery energy facility
+
+Main scenarios:
+1) PV-only: PV can only sell electricity to the day-ahead market.
+2) PV-battery sell-only: PV can sell directly or charge the battery; battery can later discharge and sell.
+3) PV-battery grid-buy: same as 2), but the battery may also buy electricity from the day-ahead market.
+
+Important:
+- This code uses annualised investment costs in the objective.
+- Therefore the objective is NOT a true NPV. It is total profit over the modelled years using annualised CAPEX.
+- The budget constraint uses full CAPEX.
+"""
+
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import xarray as xr
 import linopy
+import matplotlib.pyplot as plt
 
-prices_raw =pd.read_csv(r"C:\Users\don donson\Documents\Uni\OR\Day-ahead_prices_202001010000_202101010000_Hour.csv", encoding="latin1")
-pv_raw =pd.read_csv(r"C:\Users\don donson\Documents\Uni\OR\Capacity werte.csv",encoding="latin1", sep=",")
 
-YEARS = [2020, 2024]
-LOCATIONS = ["Stuttgart", "Düsseldorf", "Schleswig-Holstein"]
+# =============================================================================
+# 1. SETTINGS
+# =============================================================================
 
-pv_raw["time"] = pd.to_datetime(pv_raw["time"], utc=True)
-pv_raw["year"] = pv_raw["time"].dt.year
+DATA_DIR = Path("data")
+RESULTS_DIR = Path("results")
+FIGURES_DIR = RESULTS_DIR / "figures"
+RESULTS_DIR.mkdir(exist_ok=True)
+FIGURES_DIR.mkdir(exist_ok=True)
 
-print("Price data:")
-print(prices_raw.head())
-print(prices_raw.shape)
+# Put your data files into the folder "data".
+# Rename them to these names or change the paths here.
+PRICE_FILE = DATA_DIR / "Day-ahead_prices_final.csv"
+PV_FILE = DATA_DIR / "CapacityValues.csv"
 
-print("PV data:")
-print(pv_raw.head())
-print(pv_raw.shape)
+# Fallback for the uploaded file name used in some versions
+if not PV_FILE.exists() and (DATA_DIR / "CapacityValues (1).csv").exists():
+    PV_FILE = DATA_DIR / "CapacityValues (1).csv"
 
-def prepare_data(year, location):
-    pv_scenario = pv_raw[pv_raw["year"] == year].copy()
+YEARS = list(range(2015, 2025))  # 2015–2024
+LOCATIONS = ["Stuttgart", "Duesseldorf", "Schleswig-Holstein"]
 
-    price_scenario = prices_raw[str(year)].copy()
+# Use None for the default solver. If HiGHS is installed, you can use "highs".
+SOLVER_NAME = None
 
-    data = pd.DataFrame({
-        "time": pv_scenario["time"].values,
-        "price": price_scenario.values,
-        "pv_cf": pv_scenario[location].values
-    })
+# Economic parameters
+BUDGET_EUR = 10_000_000.0
+PV_INV_COST_EUR_PER_KW = 800.0
 
-    data = data.set_index("time")
-    data.index.name = "time"
+# Battery costs are split into energy and power costs.
+# This split reproduces the old assumption of roughly 390 €/kWh for a 1 MWh / 0.9 MW unit:
+# 300 €/kWh * 1000 kWh + 100 €/kW * 900 kW = 390,000 €.
+# Replace these values if you have a better source.
+BAT_ENERGY_COST_EUR_PER_KWH = 300.0
+BAT_POWER_COST_EUR_PER_KW = 100.0
 
+LIFETIME_PV_YEARS = 25
+LIFETIME_BAT_YEARS = 12
+DISCOUNT_RATE = 0.05
+ETA_CHARGE = 0.95
+ETA_DISCHARGE = 0.95
+DT_HOURS = 1.0
+
+# Which analyses should be run?
+RUN_MAIN_SCENARIOS = True
+RUN_BATTERY_COST_SENSITIVITY = True
+SENSITIVITY_LOCATIONS = ["Stuttgart"]  # keep this small first; add all locations later if needed
+BATTERY_COST_FACTORS = [1.0, 0.75, 0.50, 0.25, 0.10]
+
+MAIN_SCENARIOS = [
+    {
+        "scenario": "PV_only",
+        "battery_allowed": False,
+        "allow_grid_buy": False,
+        "battery_cost_factor": 1.0,
+    },
+    {
+        "scenario": "PV_battery_sell_only",
+        "battery_allowed": True,
+        "allow_grid_buy": False,
+        "battery_cost_factor": 1.0,
+    },
+    {
+        "scenario": "PV_battery_grid_buy",
+        "battery_allowed": True,
+        "allow_grid_buy": True,
+        "battery_cost_factor": 1.0,
+    },
+]
+
+
+# =============================================================================
+# 2. HELPER FUNCTIONS
+# =============================================================================
+
+def annuity_factor(rate: float, lifetime: int) -> float:
+    """Return the annuity factor for annualising investment costs."""
+    if rate == 0:
+        return 1.0 / lifetime
+    return (rate * (1 + rate) ** lifetime) / ((1 + rate) ** lifetime - 1)
+
+
+def scalar_value(variable) -> float:
+    """Convert a scalar linopy solution to a normal Python float."""
+    return float(np.asarray(variable.solution.values).reshape(-1)[0])
+
+
+def series_value(variable) -> pd.Series:
+    """Convert a time-dependent linopy solution to a pandas Series."""
+    return pd.Series(np.asarray(variable.solution.values).reshape(-1))
+
+
+def read_input_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read prices and PV capacity factors."""
+    if not PRICE_FILE.exists():
+        raise FileNotFoundError(f"Price file not found: {PRICE_FILE}")
+    if not PV_FILE.exists():
+        raise FileNotFoundError(f"PV file not found: {PV_FILE}")
+
+    prices_raw = pd.read_csv(PRICE_FILE, encoding="latin1")
+    pv_raw = pd.read_csv(PV_FILE, encoding="latin1")
+
+    pv_raw["time"] = pd.to_datetime(pv_raw["time"], utc=True)
+    pv_raw["year"] = pv_raw["time"].dt.year
+
+    print("Price data:", prices_raw.shape)
+    print("PV data:", pv_raw.shape)
+    print("PV columns:", list(pv_raw.columns))
+
+    return prices_raw, pv_raw
+
+
+def prepare_multiyear_data(
+    prices_raw: pd.DataFrame,
+    pv_raw: pd.DataFrame,
+    years: list[int],
+    location: str,
+) -> pd.DataFrame:
+    """
+    Prepare one continuous time series for the selected years and location.
+
+    The price file contains one column per year. Non-leap years have NaN values at the end.
+    We therefore drop NaNs in the price column and then match the number of PV hours.
+    This keeps leap years with 8784 hours instead of cutting everything to 8760 hours.
+    """
+    if location not in pv_raw.columns:
+        raise ValueError(f"Location '{location}' not found in PV data. Available: {list(pv_raw.columns)}")
+
+    all_data = []
+
+    for year in years:
+        year_str = str(year)
+        if year_str not in prices_raw.columns:
+            raise ValueError(f"Year {year} not found in price data columns.")
+
+        pv_scenario = pv_raw[pv_raw["year"] == year].copy().reset_index(drop=True)
+        price_scenario = prices_raw[year_str].dropna().reset_index(drop=True)
+
+        n = min(len(pv_scenario), len(price_scenario))
+        if n == 0:
+            raise ValueError(f"No data found for year {year}.")
+
+        if len(pv_scenario) != len(price_scenario):
+            print(
+                f"Warning: length mismatch in {year}: "
+                f"PV={len(pv_scenario)}, price={len(price_scenario)}. Using first {n} hours."
+            )
+
+        data_year = pd.DataFrame(
+            {
+                "time": pv_scenario.loc[: n - 1, "time"].values,
+                "price_EUR_per_kWh": price_scenario.loc[: n - 1].values / 1000.0,
+                "pv_cf": pv_scenario.loc[: n - 1, location].values,
+                "year": year,
+            }
+        )
+        all_data.append(data_year)
+
+    data = pd.concat(all_data, ignore_index=True)
+    data["t"] = np.arange(len(data))
+    data = data.set_index("t")
+
+    print(f"Prepared data for {location}, {years[0]}-{years[-1]}: {len(data)} hours")
     return data
 
-def run_model(year, location):
-    data = prepare_data(year, location)
 
-    time = data.index
-    time.name = "time"
+def compute_market_indicators(data: pd.DataFrame, location: str, scenario: str) -> dict:
+    """Calculate simple market indicators used to interpret the optimisation results."""
+    temp = data.copy()
+    temp = temp.set_index(pd.to_datetime(temp["time"], utc=True))
+    price_mwh = temp["price_EUR_per_kWh"] * 1000.0
+
+    daily_spread = price_mwh.resample("D").max() - price_mwh.resample("D").min()
+
+    return {
+        "location": location,
+        "scenario": scenario,
+        "avg_price_EUR_per_MWh": float(price_mwh.mean()),
+        "std_price_EUR_per_MWh": float(price_mwh.std()),
+        "avg_daily_spread_EUR_per_MWh": float(daily_spread.mean()),
+        "avg_pv_cf": float(temp["pv_cf"].mean()),
+        "hours": int(len(temp)),
+    }
+
+
+# =============================================================================
+# 3. OPTIMISATION MODEL
+# =============================================================================
+
+def run_model(
+    prices_raw: pd.DataFrame,
+    pv_raw: pd.DataFrame,
+    years: list[int],
+    location: str,
+    scenario: str,
+    battery_allowed: bool,
+    allow_grid_buy: bool,
+    battery_cost_factor: float = 1.0,
+) -> dict:
+    """Build and solve the PV-battery investment and dispatch model."""
+    data = prepare_multiyear_data(prices_raw, pv_raw, years, location)
+    t = data.index.values
+    n_hours = len(t)
+    years_count = len(years)
 
     price = xr.DataArray(
-        data["price"].values/1000.0,  # Convert from €/MWh to €/kWh
-        coords={"time": time},
-        dims=["time"]
+        data["price_EUR_per_kWh"].values,
+        coords={"t": t},
+        dims=["t"],
     )
-
     pv_cf = xr.DataArray(
         data["pv_cf"].values,
-        coords={"time": time},
-        dims=["time"]
-)
+        coords={"t": t},
+        dims=["t"],
+    )
 
-    #Parameter die echten daten brauchen wir noch 
-    E_unit = 1000.0   # kWh pro Einheit (1 MWh, a 1/10 average for LSS)
-    P_unit = 900.0    # kW pro Batterie-Einheit (0,9 MW, a 1/10 average for LSS)
-    bat_inv_cost_per_kWh = 390.0  # €/kWh (LSS average price)
-    bat_inv_cost_per_unit = bat_inv_cost_per_kWh * E_unit  # € pro Einheit
-    budget = 1000000000.0  # Budget in €
-    pv_inv_cost = 800.0  # €/kW (utility-scale PV)
-    eta_charge = 0.95
-    eta_discharge = 0.95
-    # Lifetimes
-    lifetime_pv = 25      # years for PV
-    lifetime_bat = 12     # years for battery
-    # Annualized costs (simple division by lifetime)
-    pv_inv_cost_annual = pv_inv_cost / lifetime_pv
-    bat_inv_cost_per_unit_annual = bat_inv_cost_per_unit / lifetime_bat
-    #annuitätenfaktoren für die Diskontierung der Investitionskosten
-    r = 0.05            # 5% Diskontsatz
-    T_pv = 25           # Jahre für PV
-    T_bat = 12          # Jahre für Batterie
+    bat_energy_cost = BAT_ENERGY_COST_EUR_PER_KWH * battery_cost_factor
+    bat_power_cost = BAT_POWER_COST_EUR_PER_KW * battery_cost_factor
 
-    # Annuitätenfaktoren
-    annuity_factor_pv = (r * (1 + r)**T_pv) / ((1 + r)**T_pv - 1)
-    annuity_factor_bat = (r * (1 + r)**T_bat) / ((1 + r)**T_bat - 1)
+    pv_cost_annual = PV_INV_COST_EUR_PER_KW * annuity_factor(DISCOUNT_RATE, LIFETIME_PV_YEARS)
+    bat_energy_cost_annual = bat_energy_cost * annuity_factor(DISCOUNT_RATE, LIFETIME_BAT_YEARS)
+    bat_power_cost_annual = bat_power_cost * annuity_factor(DISCOUNT_RATE, LIFETIME_BAT_YEARS)
 
-    # Annualisierte Kosten mit Diskontierung
-    pv_inv_cost_annual = pv_inv_cost * annuity_factor_pv
-    bat_inv_cost_per_unit_annual = bat_inv_cost_per_unit * annuity_factor_bat
-
-    dt = 1.0  # 1 Stunde pro Zeitschritt
-
-    # Create the optimization model
     m = linopy.Model()
 
-    #Capacityvariables
-    C_pv = m.add_variables(lower=0, name="C_pv")
-    N_bat = m.add_variables(lower=0, name="N_bat")
+    # Capacity decision variables
+    C_pv = m.add_variables(lower=0, name="C_pv")              # kW
+    E_bat = m.add_variables(lower=0, name="E_bat")            # kWh
+    P_bat = m.add_variables(lower=0, name="P_bat")            # kW
 
-    #Time-dependent variables
-    g_pv = m.add_variables(
-                lower=0,
-                dims=["time"],
-                coords={"time": time},
-                name="g_pv"
-        ) # PV generation at each time step [kWh/h]
-    charge = m.add_variables(
-                lower=0,
-                dims=["time"],
-                coords={"time": time},
-                name="charge"
-        ) # Battery charging power at each time step [kW]
+    # Operation decision variables
+    g_pv = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="g_pv")
+    charge = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="charge")
+    discharge = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="discharge")
+    soc = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="soc")
+    q_sell = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="q_sell")
 
-    discharge = m.add_variables(
-                lower=0,
-                dims=["time"],
-                coords={"time": time},
-                name="discharge"
-        ) # Battery discharging power at each time step [kW]
+    if allow_grid_buy:
+        q_buy = m.add_variables(lower=0, dims=["t"], coords={"t": t}, name="q_buy")
+    else:
+        q_buy = None
 
-    soc = m.add_variables(
-                lower=0,
-                dims=["time"],
-                coords={"time": time},
-                name="soc"
-        ) # State of charge of the battery at each time step [kWh]
+    # PV generation is limited by installed PV capacity and hourly capacity factor.
+    m.add_constraints(g_pv <= C_pv * pv_cf, name="pv_generation_limit")
 
-    q_sell = m.add_variables(
-                lower=0,
-                dims=["time"],
-                coords={"time": time},
-                name="q_sell"
-        ) # Electricity sold to the grid at each time step [kWh]
+    # Battery limits
+    m.add_constraints(charge <= P_bat, name="charge_power_limit")
+    m.add_constraints(discharge <= P_bat, name="discharge_power_limit")
+    m.add_constraints(soc <= E_bat, name="battery_energy_limit")
 
-#constraints
+    if not battery_allowed:
+        m.add_constraints(E_bat == 0, name="no_battery_energy")
+        m.add_constraints(P_bat == 0, name="no_battery_power")
+
+    # Budget uses full CAPEX, not annualised costs.
     m.add_constraints(
-    g_pv <= C_pv * pv_cf,
-    name="pv_capacity_limit"
-)
-    m.add_constraints(
-    charge <= N_bat * P_unit,
-    name="charge_power_limit"
-)
-    m.add_constraints(
-    discharge <= N_bat * P_unit,
-    name="discharge_power_limit"
-)
-    m.add_constraints(
-    soc <= N_bat * E_unit,
-    name="soc_energy_limit"
-)
-    # Budget constraint
-    m.add_constraints(
-        pv_inv_cost * C_pv + bat_inv_cost_per_unit * N_bat <= budget,
-        name="budget_limit"
-    )
-# Battery state of charge dynamics with shift
-    m.add_constraints(
-    soc == soc.shift(time=1)
-            + eta_charge * charge * dt
-            - discharge * dt / eta_discharge,
-    name="soc_dynamics"
-)
-    beginning = time[0]
-    m.add_constraints(
-    soc.sel(time=beginning) == 0,
-    name="soc_initial"
-) 
-    # Energy balance: PV + discharge = sold + charge
-    m.add_constraints(
-    g_pv + discharge == q_sell + charge,
-    name="energy_balance"
-)
-# Objective: maximize NPV
-    # Annual revenue (assumed same for all years)
-    #annual_revenue = (price * q_sell * dt).sum()
-
-    # CAPEX (full investment cost)
-    #capex = (
-        #pv_inv_cost * C_pv
-        #+ bat_inv_cost_per_unit * N_bat
-    #)
-
-    # NPV calculation
-    # Use battery lifetime (12 years) as conservative estimate
-    #T = 12  # years
-    #r = 0.05  # discount rate
-    
-    # Annuity factor: present value of 1€/year for T years
-    #annuity_factor = ((1 + r)**T - 1) / (r * (1 + r)**T)
-    
-    # NPV = PV of revenue - CAPEX
-    #npv = annual_revenue * annuity_factor - capex
-
-    #m.add_objective(
-        #npv,
-        #sense="max"
-    #)
-     # Objective: maximum profit (annual revenue - annualized costs)
-    revenue = (price * q_sell * dt).sum()
-
-    inv_costs_annual = (
-        pv_inv_cost_annual * C_pv
-        + bat_inv_cost_per_unit_annual * N_bat
+        PV_INV_COST_EUR_PER_KW * C_pv
+        + bat_energy_cost * E_bat
+        + bat_power_cost * P_bat
+        <= BUDGET_EUR,
+        name="budget_limit",
     )
 
-    m.add_objective(
-        revenue - inv_costs_annual,
-        sense="max"
+    # Battery state of charge.
+    # soc[t] is interpreted as the state of charge after hour t.
+    m.add_constraints(
+        soc.isel(t=0)
+        == ETA_CHARGE * charge.isel(t=0) * DT_HOURS
+        - discharge.isel(t=0) * DT_HOURS / ETA_DISCHARGE,
+        name="soc_first_hour",
     )
 
-# Solve
-    result = m.solve()    
-    return {
-        "model": m,
-        "result": result,
-        "C_pv": C_pv,
-        "N_bat": N_bat,
-        "g_pv": g_pv,
-        "charge": charge,
-        "discharge": discharge,
-        "soc": soc,
-        "q_sell": q_sell,
-        "price": price,
-        "pv_cf": pv_cf,
-        "budget": budget,
+    # Vectorised dynamics for t = 1, ..., n-1.
+    # Coordinates are reset to avoid xarray alignment problems.
+    dyn_coord = np.arange(n_hours - 1)
+    soc_now = soc.isel(t=slice(1, None)).assign_coords(t=dyn_coord)
+    soc_prev = soc.isel(t=slice(None, -1)).assign_coords(t=dyn_coord)
+    charge_now = charge.isel(t=slice(1, None)).assign_coords(t=dyn_coord)
+    discharge_now = discharge.isel(t=slice(1, None)).assign_coords(t=dyn_coord)
+
+    m.add_constraints(
+        soc_now
+        == soc_prev
+        + ETA_CHARGE * charge_now * DT_HOURS
+        - discharge_now * DT_HOURS / ETA_DISCHARGE,
+        name="soc_dynamics",
+    )
+
+    # End condition: the battery must end empty, so it cannot keep free value after the model horizon.
+    m.add_constraints(soc.isel(t=-1) == 0, name="soc_final_empty")
+
+    # Energy balance
+    if allow_grid_buy:
+        # PV and bought electricity can be sold directly or used to charge the battery.
+        m.add_constraints(g_pv + discharge + q_buy == q_sell + charge, name="energy_balance")
+    else:
+        # No grid buying: only PV and battery discharge can be sold or used to charge the battery.
+        m.add_constraints(g_pv + discharge == q_sell + charge, name="energy_balance")
+
+    # Objective: maximise total profit over all modelled years.
+    revenue = (price * q_sell * DT_HOURS).sum()
+    if allow_grid_buy:
+        purchase_cost = (price * q_buy * DT_HOURS).sum()
+    else:
+        purchase_cost = 0.0
+
+    annualised_investment_costs = (
+        pv_cost_annual * C_pv
+        + bat_energy_cost_annual * E_bat
+        + bat_power_cost_annual * P_bat
+    )
+    total_annualised_costs = annualised_investment_costs * years_count
+
+    m.add_objective(revenue - purchase_cost - total_annualised_costs, sense="max")
+
+    if SOLVER_NAME is None:
+        solve_status = m.solve()
+    else:
+        solve_status = m.solve(solver_name=SOLVER_NAME)
+
+    # Extract scalar results
+    C_pv_val = scalar_value(C_pv)
+    E_bat_val = scalar_value(E_bat)
+    P_bat_val = scalar_value(P_bat)
+    total_profit = float(m.objective.value)
+
+    q_sell_sol = q_sell.solution
+    total_revenue = float((price * q_sell_sol * DT_HOURS).sum())
+
+    if allow_grid_buy:
+        q_buy_sol = q_buy.solution
+        total_purchase_cost = float((price * q_buy_sol * DT_HOURS).sum())
+        grid_buy_MWh = float(q_buy_sol.sum()) / 1000.0
+    else:
+        q_buy_sol = None
+        total_purchase_cost = 0.0
+        grid_buy_MWh = 0.0
+
+    used_capex = (
+        PV_INV_COST_EUR_PER_KW * C_pv_val
+        + bat_energy_cost * E_bat_val
+        + bat_power_cost * P_bat_val
+    )
+
+    pv_available_MWh = float((C_pv_val * pv_cf).sum()) / 1000.0
+    pv_generation_MWh = float(g_pv.solution.sum()) / 1000.0
+    sold_MWh = float(q_sell.solution.sum()) / 1000.0
+    charge_MWh = float(charge.solution.sum()) / 1000.0
+    discharge_MWh = float(discharge.solution.sum()) / 1000.0
+    curtailed_MWh = max(pv_available_MWh - pv_generation_MWh, 0.0)
+
+    summary = {
+        "scenario": scenario,
+        "location": location,
+        "years": f"{years[0]}-{years[-1]}",
+        "n_years": years_count,
+        "battery_cost_factor": battery_cost_factor,
+        "allow_grid_buy": allow_grid_buy,
+        "battery_allowed": battery_allowed,
+        "solver_status": str(solve_status),
+        "pv_capacity_kW": C_pv_val,
+        "battery_energy_kWh": E_bat_val,
+        "battery_power_kW": P_bat_val,
+        "used_capex_EUR": used_capex,
+        "budget_EUR": BUDGET_EUR,
+        "total_profit_EUR": total_profit,
+        "average_annual_profit_EUR": total_profit / years_count,
+        "total_revenue_EUR": total_revenue,
+        "total_purchase_cost_EUR": total_purchase_cost,
+        "pv_available_MWh": pv_available_MWh,
+        "pv_generation_MWh": pv_generation_MWh,
+        "curtailed_MWh": curtailed_MWh,
+        "sold_MWh": sold_MWh,
+        "grid_buy_MWh": grid_buy_MWh,
+        "charge_MWh": charge_MWh,
+        "discharge_MWh": discharge_MWh,
     }
-run_model(2020, "Stuttgart")
-if __name__ == "__main__":
-    res = run_model(2020, "Stuttgart")
-    
-    print("Solver status:", res["result"])
-    print("Optimal PV capacity [kW]:", res["C_pv"].solution.values)
-    print("Optimal battery units [-]:", res["N_bat"].solution.values)
-    print("Optimal profit [€]:", res["model"].objective.value)
-    
-    # Calculate used budget
-    used_budget = (
-        (800.0 / 25) * res["C_pv"].solution.values
-        + (390.0 * 1000.0 / 12) * res["N_bat"].solution.values
+
+    # Time series for plotting one example dispatch later.
+    timeseries = pd.DataFrame(
+        {
+            "time": pd.to_datetime(data["time"].values, utc=True),
+            "year": data["year"].values,
+            "price_EUR_per_MWh": data["price_EUR_per_kWh"].values * 1000.0,
+            "pv_cf": data["pv_cf"].values,
+            "g_pv_kWh": np.asarray(g_pv.solution.values).reshape(-1),
+            "charge_kWh": np.asarray(charge.solution.values).reshape(-1),
+            "discharge_kWh": np.asarray(discharge.solution.values).reshape(-1),
+            "soc_kWh": np.asarray(soc.solution.values).reshape(-1),
+            "q_sell_kWh": np.asarray(q_sell.solution.values).reshape(-1),
+        }
     )
-    print("Used annualized budget [€]:", used_budget)
+    if allow_grid_buy:
+        timeseries["q_buy_kWh"] = np.asarray(q_buy.solution.values).reshape(-1)
+    else:
+        timeseries["q_buy_kWh"] = 0.0
+
+    market_indicators = compute_market_indicators(data, location, scenario)
+
+    return {
+        "summary": summary,
+        "timeseries": timeseries,
+        "market_indicators": market_indicators,
+        "model": m,
+    }
+
+
+# =============================================================================
+# 4. RUN SCENARIOS
+# =============================================================================
+
+def run_all_scenarios() -> tuple[pd.DataFrame, pd.DataFrame]:
+    prices_raw, pv_raw = read_input_data()
+
+    summaries = []
+    indicators = []
+    example_timeseries = None
+
+    if RUN_MAIN_SCENARIOS:
+        for location in LOCATIONS:
+            for sc in MAIN_SCENARIOS:
+                print("\n" + "=" * 80)
+                print(f"Running {sc['scenario']} | {location} | {YEARS[0]}-{YEARS[-1]}")
+                print("=" * 80)
+
+                result = run_model(
+                    prices_raw=prices_raw,
+                    pv_raw=pv_raw,
+                    years=YEARS,
+                    location=location,
+                    scenario=sc["scenario"],
+                    battery_allowed=sc["battery_allowed"],
+                    allow_grid_buy=sc["allow_grid_buy"],
+                    battery_cost_factor=sc["battery_cost_factor"],
+                )
+                summaries.append(result["summary"])
+                indicators.append(result["market_indicators"])
+
+                # Save one example dispatch for plotting.
+                if location == "Stuttgart" and sc["scenario"] == "PV_battery_grid_buy":
+                    example_timeseries = result["timeseries"]
+
+    if RUN_BATTERY_COST_SENSITIVITY:
+        for location in SENSITIVITY_LOCATIONS:
+            for factor in BATTERY_COST_FACTORS:
+                print("\n" + "=" * 80)
+                print(f"Running sensitivity | {location} | battery cost factor {factor}")
+                print("=" * 80)
+
+                result = run_model(
+                    prices_raw=prices_raw,
+                    pv_raw=pv_raw,
+                    years=YEARS,
+                    location=location,
+                    scenario="battery_cost_sensitivity_sell_only",
+                    battery_allowed=True,
+                    allow_grid_buy=False,
+                    battery_cost_factor=factor,
+                )
+                summaries.append(result["summary"])
+                indicators.append(result["market_indicators"])
+
+    summary_df = pd.DataFrame(summaries)
+    indicators_df = pd.DataFrame(indicators)
+
+    summary_path = RESULTS_DIR / "results_summary.csv"
+    indicators_path = RESULTS_DIR / "market_indicators.csv"
+    summary_df.to_csv(summary_path, index=False)
+    indicators_df.to_csv(indicators_path, index=False)
+
+    print(f"\nSaved: {summary_path}")
+    print(f"Saved: {indicators_path}")
+    print("\nSummary:")
+    print(summary_df)
+
+    plot_results(summary_df, indicators_df)
+
+    if example_timeseries is not None:
+        example_path = RESULTS_DIR / "example_dispatch_timeseries.csv"
+        example_timeseries.to_csv(example_path, index=False)
+        plot_example_dispatch(example_timeseries)
+        print(f"Saved: {example_path}")
+
+    return summary_df, indicators_df
+
+
+# =============================================================================
+# 5. PLOTS
+# =============================================================================
+
+def plot_results(summary_df: pd.DataFrame, indicators_df: pd.DataFrame) -> None:
+    """Create basic plots for report and presentation."""
+    main_df = summary_df[summary_df["scenario"].isin([s["scenario"] for s in MAIN_SCENARIOS])].copy()
+
+    if not main_df.empty:
+        # Average annual profit by scenario and location
+        pivot_profit = main_df.pivot(index="location", columns="scenario", values="average_annual_profit_EUR")
+        ax = pivot_profit.plot(kind="bar", figsize=(10, 5))
+        ax.set_ylabel("Average annual profit [€]")
+        ax.set_xlabel("Location")
+        ax.set_title("Average annual profit by location and scenario")
+        plt.tight_layout()
+        plt.savefig(FIGURES_DIR / "average_annual_profit_by_location_scenario.png", dpi=300)
+        plt.close()
+
+        # PV capacity by scenario and location
+        pivot_pv = main_df.pivot(index="location", columns="scenario", values="pv_capacity_kW")
+        ax = pivot_pv.plot(kind="bar", figsize=(10, 5))
+        ax.set_ylabel("PV capacity [kW]")
+        ax.set_xlabel("Location")
+        ax.set_title("Optimal PV capacity by location and scenario")
+        plt.tight_layout()
+        plt.savefig(FIGURES_DIR / "pv_capacity_by_location_scenario.png", dpi=300)
+        plt.close()
+
+        # Battery energy capacity by scenario and location
+        pivot_bat_e = main_df.pivot(index="location", columns="scenario", values="battery_energy_kWh")
+        ax = pivot_bat_e.plot(kind="bar", figsize=(10, 5))
+        ax.set_ylabel("Battery energy capacity [kWh]")
+        ax.set_xlabel("Location")
+        ax.set_title("Optimal battery energy capacity by location and scenario")
+        plt.tight_layout()
+        plt.savefig(FIGURES_DIR / "battery_energy_capacity_by_location_scenario.png", dpi=300)
+        plt.close()
+
+        # Battery power capacity by scenario and location
+        pivot_bat_p = main_df.pivot(index="location", columns="scenario", values="battery_power_kW")
+        ax = pivot_bat_p.plot(kind="bar", figsize=(10, 5))
+        ax.set_ylabel("Battery power capacity [kW]")
+        ax.set_xlabel("Location")
+        ax.set_title("Optimal battery power capacity by location and scenario")
+        plt.tight_layout()
+        plt.savefig(FIGURES_DIR / "battery_power_capacity_by_location_scenario.png", dpi=300)
+        plt.close()
+
+    sens_df = summary_df[summary_df["scenario"] == "battery_cost_sensitivity_sell_only"].copy()
+    if not sens_df.empty:
+        for location in sorted(sens_df["location"].unique()):
+            loc_df = sens_df[sens_df["location"] == location].sort_values("battery_cost_factor")
+
+            ax = loc_df.plot(x="battery_cost_factor", y="battery_energy_kWh", marker="o", figsize=(8, 5), legend=False)
+            ax.set_xlabel("Battery cost factor")
+            ax.set_ylabel("Battery energy capacity [kWh]")
+            ax.set_title(f"Battery energy capacity under cost sensitivity – {location}")
+            plt.tight_layout()
+            plt.savefig(FIGURES_DIR / f"battery_energy_sensitivity_{location}.png", dpi=300)
+            plt.close()
+
+            ax = loc_df.plot(x="battery_cost_factor", y="average_annual_profit_EUR", marker="o", figsize=(8, 5), legend=False)
+            ax.set_xlabel("Battery cost factor")
+            ax.set_ylabel("Average annual profit [€]")
+            ax.set_title(f"Profit under battery cost sensitivity – {location}")
+            plt.tight_layout()
+            plt.savefig(FIGURES_DIR / f"profit_sensitivity_{location}.png", dpi=300)
+            plt.close()
+
+    if not indicators_df.empty:
+        # Market indicators table is saved as CSV; this scatter helps interpret battery profitability.
+        merged = pd.merge(
+            main_df,
+            indicators_df[["location", "scenario", "avg_daily_spread_EUR_per_MWh"]],
+            on=["location", "scenario"],
+            how="left",
+        )
+        if not merged.empty:
+            ax = merged.plot(
+                x="avg_daily_spread_EUR_per_MWh",
+                y="average_annual_profit_EUR",
+                kind="scatter",
+                figsize=(8, 5),
+            )
+            ax.set_xlabel("Average daily price spread [€/MWh]")
+            ax.set_ylabel("Average annual profit [€]")
+            ax.set_title("Profit and average daily price spread")
+            plt.tight_layout()
+            plt.savefig(FIGURES_DIR / "profit_vs_daily_price_spread.png", dpi=300)
+            plt.close()
+
+
+def plot_example_dispatch(timeseries: pd.DataFrame) -> None:
+    """Plot dispatch for a representative week."""
+    ts = timeseries.copy()
+    ts["time"] = pd.to_datetime(ts["time"], utc=True)
+    ts = ts.set_index("time")
+
+    # Choose a week with meaningful PV output. Change the dates if needed.
+    week = ts.loc["2024-06-01":"2024-06-07"].copy()
+    if week.empty:
+        week = ts.iloc[:168].copy()
+
+    ax = week[["g_pv_kWh", "q_sell_kWh", "charge_kWh", "discharge_kWh"]].plot(figsize=(12, 5))
+    ax.set_ylabel("Energy per hour [kWh]")
+    ax.set_xlabel("Time")
+    ax.set_title("Example dispatch week")
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / "example_dispatch_week.png", dpi=300)
+    plt.close()
+
+    ax = week[["soc_kWh"]].plot(figsize=(12, 5), legend=False)
+    ax.set_ylabel("State of charge [kWh]")
+    ax.set_xlabel("Time")
+    ax.set_title("Battery state of charge during example week")
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / "example_soc_week.png", dpi=300)
+    plt.close()
+
+    ax = week[["price_EUR_per_MWh"]].plot(figsize=(12, 5), legend=False)
+    ax.set_ylabel("Day-ahead price [€/MWh]")
+    ax.set_xlabel("Time")
+    ax.set_title("Day-ahead prices during example week")
+    plt.tight_layout()
+    plt.savefig(FIGURES_DIR / "example_price_week.png", dpi=300)
+    plt.close()
+
+
+# =============================================================================
+# 6. MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    run_all_scenarios()
